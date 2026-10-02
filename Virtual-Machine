@@ -1,0 +1,199 @@
+<#
+.SYNOPSIS
+    Creates a new virtual machine in Microsoft Hyper-V.
+
+.DESCRIPTION
+    Creates a VM with a new dynamically expanding VHDX, configures CPU and memory,
+    connects it to a virtual switch, optionally attaches an installation ISO,
+    sets the boot order, optionally enables a virtual TPM (needed for Windows 11),
+    and optionally starts the VM.
+
+    Must be run from an elevated PowerShell session on a host with Hyper-V enabled.
+
+.EXAMPLE
+    .\New-HyperVVM.ps1 -VMName "WIN11-TEST01" -IsoPath "D:\ISO\Win11.iso" -EnableTPM -Start
+
+.EXAMPLE
+    .\New-HyperVVM.ps1 -VMName "UBUNTU01" -MemoryStartupGB 4 -ProcessorCount 2 `
+        -IsoPath "D:\ISO\ubuntu-24.04.iso" -SecureBootTemplate MicrosoftUEFICertificateAuthority
+
+.EXAMPLE
+    .\New-HyperVVM.ps1 -VMName "TEST01" -WhatIf
+#>
+
+#Requires -RunAsAdministrator
+#Requires -Modules Hyper-V
+
+[CmdletBinding(SupportsShouldProcess = $true)]
+param (
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[\w\-\.]{1,64}$')]
+    [string]$VMName,
+
+    [ValidateSet(1, 2)]
+    [int]$Generation = 2,
+
+    [ValidateRange(1, 64)]
+    [int]$ProcessorCount = 2,
+
+    [ValidateRange(1, 1024)]
+    [int]$MemoryStartupGB = 4,
+
+    [switch]$DynamicMemory,
+
+    [ValidateRange(1, 1024)]
+    [int]$MemoryMinimumGB = 2,
+
+    [ValidateRange(1, 1024)]
+    [int]$MemoryMaximumGB = 8,
+
+    [ValidateRange(10, 65536)]
+    [int]$VhdSizeGB = 80,
+
+    # Defaults to the host's configured VM and VHD locations if not supplied
+    [string]$VMPath,
+    [string]$VhdPath,
+
+    # Defaults to the first external switch found, then any switch
+    [string]$SwitchName,
+
+    [ValidateScript({ Test-Path $_ -PathType Leaf })]
+    [string]$IsoPath,
+
+    # Use MicrosoftUEFICertificateAuthority for most Linux distributions
+    [ValidateSet('MicrosoftWindows', 'MicrosoftUEFICertificateAuthority', 'OpenSourceShieldedVM')]
+    [string]$SecureBootTemplate = 'MicrosoftWindows',
+
+    [switch]$EnableTPM,
+
+    [switch]$Start
+)
+
+$ErrorActionPreference = 'Stop'
+
+# --- Pre-flight checks ------------------------------------------------------
+
+if (Get-VM -Name $VMName -ErrorAction SilentlyContinue) {
+    throw "A VM named '$VMName' already exists on this host."
+}
+
+if ($DynamicMemory) {
+    if ($MemoryMinimumGB -gt $MemoryStartupGB -or $MemoryStartupGB -gt $MemoryMaximumGB) {
+        throw "Dynamic memory requires Minimum <= Startup <= Maximum."
+    }
+}
+
+if ($EnableTPM -and $Generation -ne 2) {
+    throw "A virtual TPM requires a Generation 2 VM."
+}
+
+$vmHost = Get-VMHost
+if (-not $VMPath)  { $VMPath  = $vmHost.VirtualMachinePath }
+if (-not $VhdPath) { $VhdPath = $vmHost.VirtualHardDiskPath }
+
+$vhdFile = Join-Path $VhdPath "$VMName.vhdx"
+if (Test-Path $vhdFile) {
+    throw "A virtual disk already exists at '$vhdFile'."
+}
+
+# Pick a virtual switch
+if ($SwitchName) {
+    $switch = Get-VMSwitch -Name $SwitchName -ErrorAction SilentlyContinue
+    if (-not $switch) { throw "Virtual switch '$SwitchName' was not found." }
+}
+else {
+    $switch = Get-VMSwitch | Where-Object SwitchType -eq 'External' | Select-Object -First 1
+    if (-not $switch) { $switch = Get-VMSwitch | Select-Object -First 1 }
+    if (-not $switch) { throw "No virtual switches exist. Create one with New-VMSwitch first." }
+}
+Write-Verbose "Using virtual switch '$($switch.Name)' ($($switch.SwitchType))."
+
+# --- Create the VM ----------------------------------------------------------
+
+if ($PSCmdlet.ShouldProcess($VMName, "Create Generation $Generation VM")) {
+
+    $vm = $null
+    try {
+        Write-Host "Creating VM '$VMName'..." -ForegroundColor Cyan
+
+        $vm = New-VM -Name $VMName `
+                     -Generation $Generation `
+                     -MemoryStartupBytes ($MemoryStartupGB * 1GB) `
+                     -Path $VMPath `
+                     -NewVHDPath $vhdFile `
+                     -NewVHDSizeBytes ($VhdSizeGB * 1GB) `
+                     -SwitchName $switch.Name
+
+        # CPU
+        Set-VMProcessor -VM $vm -Count $ProcessorCount
+
+        # Memory
+        if ($DynamicMemory) {
+            Set-VMMemory -VM $vm -DynamicMemoryEnabled $true `
+                         -MinimumBytes ($MemoryMinimumGB * 1GB) `
+                         -StartupBytes ($MemoryStartupGB * 1GB) `
+                         -MaximumBytes ($MemoryMaximumGB * 1GB)
+        }
+        else {
+            Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
+        }
+
+        # Installation media and boot order
+        if ($IsoPath) {
+            if ($Generation -eq 2) {
+                $dvd = Add-VMDvdDrive -VM $vm -Path $IsoPath -Passthru
+                $hdd = Get-VMHardDiskDrive -VM $vm | Select-Object -First 1
+                $nic = Get-VMNetworkAdapter -VM $vm | Select-Object -First 1
+                Set-VMFirmware -VM $vm -BootOrder $dvd, $hdd, $nic
+            }
+            else {
+                Set-VMDvdDrive -VMName $VMName -Path $IsoPath
+                Set-VMBios -VM $vm -StartupOrder @('CD', 'IDE', 'LegacyNetworkAdapter', 'Floppy')
+            }
+        }
+
+        # Secure Boot (Gen 2 only)
+        if ($Generation -eq 2) {
+            Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate $SecureBootTemplate
+        }
+
+        # Virtual TPM (Windows 11 / BitLocker)
+        if ($EnableTPM) {
+            Set-VMKeyProtector -VM $vm -NewLocalKeyProtector
+            Enable-VMTPM -VM $vm
+        }
+
+        # Sensible defaults
+        Set-VM -VM $vm -AutomaticCheckpointsEnabled $false `
+                       -AutomaticStartAction Nothing `
+                       -AutomaticStopAction ShutDown
+        Enable-VMIntegrationService -VM $vm -Name 'Guest Service Interface'
+
+        if ($Start) {
+            Write-Host "Starting VM '$VMName'..." -ForegroundColor Cyan
+            Start-VM -VM $vm
+        }
+
+        Write-Host "VM '$VMName' created successfully." -ForegroundColor Green
+        Get-VM -Name $VMName |
+            Select-Object Name, State, Generation, ProcessorCount,
+                @{ n = 'MemoryStartupGB'; e = { $_.MemoryStartup / 1GB } },
+                DynamicMemoryEnabled, Path |
+            Format-List
+    }
+    catch {
+        Write-Warning "VM creation failed: $($_.Exception.Message)"
+
+        # Roll back partial work so the script can be re-run cleanly
+        if (Get-VM -Name $VMName -ErrorAction SilentlyContinue) {
+            Write-Warning "Removing partially created VM '$VMName'..."
+            Stop-VM -Name $VMName -TurnOff -Force -ErrorAction SilentlyContinue
+            Remove-VM -Name $VMName -Force
+        }
+        if (Test-Path $vhdFile) {
+            Write-Warning "Removing virtual disk '$vhdFile'..."
+            Remove-Item $vhdFile -Force
+        }
+        throw
+    }
+}
